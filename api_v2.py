@@ -154,10 +154,10 @@ class TTS_Request(BaseModel):
     aux_ref_audio_paths: list = None
     prompt_lang: str = None
     prompt_text: str = ""
-    top_k: int = 5
-    top_p: float = 1
-    temperature: float = 1
-    text_split_method: str = "cut5"
+    top_k: int = 15
+    top_p: float = 0.8
+    temperature: float = 0.35
+    text_split_method: str = "cut1"
     batch_size: int = 1
     batch_threshold: float = 0.75
     split_bucket: bool = True
@@ -166,7 +166,7 @@ class TTS_Request(BaseModel):
     seed: int = -1
     media_type: str = "wav"
     streaming_mode: bool = False
-    parallel_infer: bool = True
+    parallel_infer: bool = False
     repetition_penalty: float = 1.35
     sample_steps: int = 32
     super_sampling: bool = False
@@ -388,10 +388,10 @@ async def tts_get_endpoint(
     aux_ref_audio_paths: list = None,
     prompt_lang: str = None,
     prompt_text: str = "",
-    top_k: int = 5,
-    top_p: float = 1,
-    temperature: float = 1,
-    text_split_method: str = "cut0",
+    top_k: int = 15,
+    top_p: float = 0.8,
+    temperature: float = 0.35,
+    text_split_method: str = "cut1",
     batch_size: int = 1,
     batch_threshold: float = 0.75,
     split_bucket: bool = True,
@@ -400,7 +400,7 @@ async def tts_get_endpoint(
     seed: int = -1,
     media_type: str = "wav",
     streaming_mode: bool = False,
-    parallel_infer: bool = True,
+    parallel_infer: bool = False,
     repetition_penalty: float = 1.35,
     sample_steps: int = 32,
     super_sampling: bool = False,

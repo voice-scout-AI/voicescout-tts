@@ -301,10 +301,11 @@ class TTS_Config:
             configs: dict = self._load_configs(self.configs_path)
 
         assert isinstance(configs, dict)
-        version = configs.get("version", "v2").lower()
+        version = configs.get("version", "v2ProPlus")
+
         assert version in ["v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus"]
         self.default_configs[version] = configs.get(version, self.default_configs[version])
-        self.configs: dict = configs.get("custom", deepcopy(self.default_configs[version]))
+        self.configs: dict = configs.get("v2ProPlus", deepcopy(self.default_configs[version]))
 
         self.device = self.configs.get("device", torch.device("cpu"))
         if "cuda" in str(self.device) and not torch.cuda.is_available():
@@ -1007,10 +1008,10 @@ class TTS:
         aux_ref_audio_paths: list = inputs.get("aux_ref_audio_paths", [])
         prompt_text: str = inputs.get("prompt_text", "")
         prompt_lang: str = inputs.get("prompt_lang", "")
-        top_k: int = inputs.get("top_k", 5)
-        top_p: float = inputs.get("top_p", 1)
-        temperature: float = inputs.get("temperature", 1)
-        text_split_method: str = inputs.get("text_split_method", "cut0")
+        top_k: int = inputs.get("top_k", 15)
+        top_p: float = inputs.get("top_p", 0.8)
+        temperature: float = inputs.get("temperature", 0.35)
+        text_split_method: str = inputs.get("text_split_method", "cut1")
         batch_size = inputs.get("batch_size", 1)
         batch_threshold = inputs.get("batch_threshold", 0.75)
         speed_factor = inputs.get("speed_factor", 1.0)
@@ -1020,7 +1021,7 @@ class TTS:
         seed = inputs.get("seed", -1)
         seed = -1 if seed in ["", None] else seed
         actual_seed = set_seed(seed)
-        parallel_infer = inputs.get("parallel_infer", True)
+        parallel_infer = inputs.get("parallel_infer", False)
         repetition_penalty = inputs.get("repetition_penalty", 1.35)
         sample_steps = inputs.get("sample_steps", 32)
         super_sampling = inputs.get("super_sampling", False)
