@@ -190,9 +190,9 @@ class User(BaseModel):
     text: str
 
 class TrainRequest(BaseModel):
-    exp_name: str = "test"
-    inp_text: str = "GPT_SoVITS/output/asr_opt/slicer_opt.list"
-    inp_wav_dir: str = f"GPT_SoVITS/user_data/0"
+    exp_name: Optional[str] = "test"
+    inp_text: Optional[str] = "GPT_SoVITS/output/asr_opt/slicer_opt.list"
+    inp_wav_dir: Optional[str] = f"GPT_SoVITS/user/0"
     
 # 훈련 상태 추적용 전역 변수
 training_status = {
@@ -570,6 +570,135 @@ async def get_users():
         return JSONResponse(status_code=500, content={"message": "데이터베이스 조회 실패", "Exception": str(e)})
 
 
+def cleanup_experiment_files(exp_dir: str, tmp_dir: str, exp_name: str):
+    """훈련 완료 후 불필요한 파일들 정리 및 최적 모델 파일명 변경"""
+    import shutil
+    import glob
+    import re
+    
+    try:
+        print(f"🗑️ 실험 파일 정리 및 모델 파일명 변경 시작: {exp_name}")
+        
+        # 1. 최적 모델 파일 이름 변경
+        rename_best_model_files(exp_name)
+        
+        # 2. 실험 디렉토리 전체 삭제
+        if os.path.exists(exp_dir):
+            shutil.rmtree(exp_dir)
+            print(f"✅ 삭제 완료: {exp_dir}")
+        
+        # 3. 임시 파일들 삭제
+        temp_files = [
+            f"{tmp_dir}/tmp_s2.json",
+            f"{tmp_dir}/tmp_s1.yaml"
+        ]
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+                print(f"✅ 삭제 완료: {temp_file}")
+        
+        print(f"🎉 정리 완료! {exp_name} 최적 모델 파일들이 준비되었습니다.")
+        
+    except Exception as e:
+        print(f"⚠️ 정리 중 오류: {e}")
+
+
+def rename_best_model_files(exp_name: str):
+    """가장 성능이 좋은 모델 파일들을 exp_name으로 이름 변경"""
+    try:
+        print(f"🔄 최적 모델 파일 이름 변경 중: {exp_name}")
+        
+        # SoVITS 모델 파일 처리
+        sovits_dir = "SoVITS_weights_v2ProPlus"
+        if os.path.exists(sovits_dir):
+            # 가장 높은 에포크의 메인 모델 찾기
+            sovits_pattern = f"{sovits_dir}/{exp_name}_e*_s*.pth"
+            sovits_files = glob.glob(sovits_pattern)
+            
+            if sovits_files:
+                # 에포크와 스텝 번호로 정렬해서 가장 최신 파일 선택
+                def extract_epoch_step(filepath):
+                    match = re.search(r'_e(\d+)_s(\d+)\.pth$', filepath)
+                    if match:
+                        return (int(match.group(1)), int(match.group(2)))
+                    return (0, 0)
+                
+                best_sovits = max(sovits_files, key=extract_epoch_step)
+                new_sovits_name = f"{sovits_dir}/{exp_name}.pth"
+                
+                if os.path.exists(new_sovits_name):
+                    os.remove(new_sovits_name)
+                os.rename(best_sovits, new_sovits_name)
+                print(f"✅ SoVITS 모델: {best_sovits} → {new_sovits_name}")
+                
+                # LoRA 파일들은 TTS 추론에 불필요하므로 삭제
+                lora_pattern = f"{sovits_dir}/{exp_name}_e*_s*_lora.ckpt"
+                lora_files = glob.glob(lora_pattern)
+                for lora_file in lora_files:
+                    os.remove(lora_file)
+                    print(f"🗑️ LoRA 파일 삭제 (추론에 불필요): {lora_file}")
+        
+        # GPT 모델 파일 처리
+        gpt_dir = "GPT_weights_v2ProPlus"
+        if os.path.exists(gpt_dir):
+            # 가장 높은 에포크의 모델 찾기
+            gpt_pattern = f"{gpt_dir}/{exp_name}-e*.ckpt"
+            gpt_files = glob.glob(gpt_pattern)
+            
+            if gpt_files:
+                # 에포크 번호로 정렬해서 가장 최신 파일 선택
+                def extract_gpt_epoch(filepath):
+                    match = re.search(r'-e(\d+)\.ckpt$', filepath)
+                    if match:
+                        return int(match.group(1))
+                    return 0
+                
+                best_gpt = max(gpt_files, key=extract_gpt_epoch)
+                new_gpt_name = f"{gpt_dir}/{exp_name}.ckpt"
+                
+                if os.path.exists(new_gpt_name):
+                    os.remove(new_gpt_name)
+                os.rename(best_gpt, new_gpt_name)
+                print(f"✅ GPT 모델: {best_gpt} → {new_gpt_name}")
+        
+        # 중간 체크포인트 파일들 정리 (선택사항)
+        cleanup_intermediate_checkpoints(exp_name)
+        
+    except Exception as e:
+        print(f"⚠️ 모델 파일 이름 변경 중 오류: {e}")
+
+
+def cleanup_intermediate_checkpoints(exp_name: str):
+    """중간 체크포인트 파일들 정리 (최종 모델만 남기고 삭제)"""
+    try:
+        # SoVITS 중간 파일들 삭제
+        sovits_dir = "SoVITS_weights_v2ProPlus"
+        if os.path.exists(sovits_dir):
+            for file in os.listdir(sovits_dir):
+                if (exp_name in file and 
+                    (file.endswith('.pth') or file.endswith('.ckpt')) and
+                    file != f"{exp_name}.pth"):  # 메인 모델 파일만 보존
+                    file_path = f"{sovits_dir}/{file}"
+                    os.remove(file_path)
+                    print(f"🗑️ 중간 파일 삭제: {file_path}")
+        
+        # GPT 중간 파일들 삭제
+        gpt_dir = "GPT_weights_v2ProPlus"
+        if os.path.exists(gpt_dir):
+            for file in os.listdir(gpt_dir):
+                if (exp_name in file and 
+                    file.endswith('.ckpt') and
+                    file != f"{exp_name}.ckpt"):
+                    file_path = f"{gpt_dir}/{file}"
+                    os.remove(file_path)
+                    print(f"🗑️ 중간 파일 삭제: {file_path}")
+                    
+        print("✅ 중간 체크포인트 파일들 정리 완료")
+        
+    except Exception as e:
+        print(f"⚠️ 중간 파일 정리 중 오류: {e}")
+
+
 def run_training_pipeline(request: TrainRequest):
     """백그라운드에서 실행되는 훈련 파이프라인"""
     global training_status
@@ -587,8 +716,10 @@ def run_training_pipeline(request: TrainRequest):
         tmp_dir = os.path.join(now_dir, "TEMP")
         os.makedirs(tmp_dir, exist_ok=True)
         
+        # 실험명 일관성 확보
+        exp_name = request.exp_name.rstrip(' ')
         exp_root = "logs"  # 실험 디렉토리 루트
-        exp_dir = f"{exp_root}/{request.exp_name.rstrip(' ')}"
+        exp_dir = f"{exp_root}/{exp_name}"
         os.makedirs(exp_dir, exist_ok=True)
         
         # Python 실행자 설정
@@ -609,7 +740,7 @@ def run_training_pipeline(request: TrainRequest):
             config = {
                 "inp_text": request.inp_text,
                 "inp_wav_dir": request.inp_wav_dir,
-                "exp_name": request.exp_name.rstrip(' '),
+                "exp_name": exp_name,
                 "opt_dir": exp_dir,
                 "bert_pretrained_dir": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
                 "is_half": "True",
@@ -625,6 +756,25 @@ def run_training_pipeline(request: TrainRequest):
             print(f"실행 명령어: {cmd}")
             process = Popen(cmd, shell=True)
             process.wait()
+            
+            # 개별 파트 파일들을 하나로 병합 (webui.py 로직과 동일)
+            opt = []
+            i_part = 0
+            while True:
+                part_file = f"{exp_dir}/2-name2text-{i_part}.txt"
+                if not os.path.exists(part_file):
+                    break
+                print(f"파트 파일 병합 중: {part_file}")
+                with open(part_file, "r", encoding="utf8") as f:
+                    opt += f.read().strip("\n").split("\n")
+                os.remove(part_file)  # 개별 파일 삭제
+                i_part += 1
+            
+            # 통합 파일 생성
+            if opt:
+                with open(path_text, "w", encoding="utf8") as f:
+                    f.write("\n".join(opt) + "\n")
+                print(f"병합 완료: {len(opt)}개 항목을 {path_text}에 저장")
             
             # 결과 검증
             if not os.path.exists(path_text) or os.path.getsize(path_text) == 0:
@@ -675,6 +825,25 @@ def run_training_pipeline(request: TrainRequest):
             process = Popen(cmd, shell=True)
             process.wait()
             
+            # 개별 파트 파일들을 하나로 병합 (webui.py 로직과 동일)
+            opt = ["item_name\tsemantic_audio"]  # 헤더 추가
+            i_part = 0
+            while True:
+                part_file = f"{exp_dir}/6-name2semantic-{i_part}.tsv"
+                if not os.path.exists(part_file):
+                    break
+                print(f"파트 파일 병합 중: {part_file}")
+                with open(part_file, "r", encoding="utf8") as f:
+                    opt += f.read().strip("\n").split("\n")
+                os.remove(part_file)  # 개별 파일 삭제
+                i_part += 1
+            
+            # 통합 파일 생성
+            if len(opt) > 1:  # 헤더 외에 데이터가 있는 경우
+                with open(path_semantic, "w", encoding="utf8") as f:
+                    f.write("\n".join(opt) + "\n")
+                print(f"병합 완료: {len(opt)-1}개 항목을 {path_semantic}에 저장")
+            
             # 결과 검증
             if not os.path.exists(path_semantic) or os.path.getsize(path_semantic) < 31:
                 raise Exception("1C 단계 실패: 의미론적 토큰 파일이 생성되지 않았습니다.")
@@ -708,7 +877,7 @@ def run_training_pipeline(request: TrainRequest):
         s2_config["data"]["exp_dir"] = exp_dir
         s2_config["s2_ckpt_dir"] = exp_dir
         s2_config["save_weight_dir"] = "SoVITS_weights_v2ProPlus"
-        s2_config["name"] = request.exp_name.rstrip(' ')
+        s2_config["name"] = exp_name
         s2_config["version"] = "v2ProPlus"
         
         tmp_s2_config = f"{tmp_dir}/tmp_s2.json"
@@ -743,7 +912,7 @@ def run_training_pipeline(request: TrainRequest):
         s1_config["train"]["if_save_latest"] = True
         s1_config["train"]["if_dpo"] = False
         s1_config["train"]["half_weights_save_dir"] = "GPT_weights_v2ProPlus"
-        s1_config["train"]["exp_name"] = request.exp_name.rstrip(' ')
+        s1_config["train"]["exp_name"] = exp_name
         s1_config["train_semantic_path"] = f"{exp_dir}/6-name2semantic.tsv"
         s1_config["train_phoneme_path"] = f"{exp_dir}/2-name2text.txt"
         s1_config["output_dir"] = f"{exp_dir}/logs_s1_v2ProPlus"
@@ -761,10 +930,19 @@ def run_training_pipeline(request: TrainRequest):
         process = Popen(cmd, shell=True)
         process.wait()
         
+        # 훈련 완료 후 정리 작업 (선택사항)
+        training_status.update({
+            "current_stage": "정리 작업",
+            "progress": "훈련 파일 정리 중..."
+        })
+        
+        # 실험 디렉토리 정리 (주석 해제하면 자동 삭제)
+        cleanup_experiment_files(exp_dir, tmp_dir, exp_name)
+        
         # 훈련 완료
         training_status.update({
             "is_training": False,
-            "current_stage": "완료",
+            "current_stage": "완료", 
             "progress": "모든 훈련이 성공적으로 완료되었습니다!",
             "error": None
         })
