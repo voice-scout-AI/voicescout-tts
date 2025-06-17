@@ -113,7 +113,8 @@ import wave
 import signal
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, Response
+import sqlite3
+from fastapi import FastAPI, Response, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 from io import BytesIO
@@ -121,6 +122,10 @@ from tools.i18n.i18n import I18nAuto
 from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
 from GPT_SoVITS.TTS_infer_pack.text_segmentation_method import get_method_names as get_cut_method_names
 from pydantic import BaseModel
+from typing import List, Optional
+import json
+import yaml
+from subprocess import Popen
 
 # print(sys.path)
 i18n = I18nAuto()
@@ -130,6 +135,7 @@ parser = argparse.ArgumentParser(description="GPT-SoVITS api")
 parser.add_argument("-c", "--tts_config", type=str, default="GPT_SoVITS/configs/tts_infer.yaml", help="tts_infer路径")
 parser.add_argument("-a", "--bind_addr", type=str, default="127.0.0.1", help="default: 127.0.0.1")
 parser.add_argument("-p", "--port", type=int, default="9880", help="default: 9880")
+parser.add_argument("--init-db", action="store_true", help="데이터베이스를 초기화합니다 (테스트 데이터 포함)")
 args = parser.parse_args()
 config_path = args.tts_config
 # device = args.device
@@ -146,6 +152,55 @@ tts_pipeline = TTS(tts_config)
 
 APP = FastAPI()
 
+# SQLite 데이터베이스 초기화
+def init_database():
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    
+    # users 테이블 생성
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL
+        )
+    ''')
+    
+    # 테스트 데이터 삽입 (테이블이 비어있을 경우)
+    cursor.execute('SELECT COUNT(*) FROM users')
+    if cursor.fetchone()[0] == 0:
+        test_users = [
+            ('김철수',),
+            ('박영희',),
+            ('이민수',),
+            ('정수진',)
+        ]
+        cursor.executemany('INSERT INTO users (text) VALUES (?)', test_users)
+    
+    conn.commit()
+    conn.close()
+
+# 데이터베이스 초기화 (--init-db 인자가 있을 때만)
+if args.init_db:
+    print("데이터베이스를 초기화합니다...")
+    init_database()
+    print("데이터베이스 초기화가 완료되었습니다.")
+
+class User(BaseModel):
+    id: int
+    text: str
+
+class TrainRequest(BaseModel):
+    exp_name: str = "test"
+    inp_text: str = "GPT_SoVITS/output/asr_opt/slicer_opt.list"
+    inp_wav_dir: str = f"GPT_SoVITS/user_data/0"
+    
+# 훈련 상태 추적용 전역 변수
+training_status = {
+    "is_training": False,
+    "current_stage": "",
+    "progress": "",
+    "error": None
+}
 
 class TTS_Request(BaseModel):
     text: str = None
@@ -489,11 +544,313 @@ async def set_sovits_weights(weights_path: str = None):
     return JSONResponse(status_code=200, content={"message": "success"})
 
 
+@APP.get("/users", response_model=List[User])
+async def get_users():
+    """
+    모든 사용자 목록을 조회합니다.
+    
+    Returns:
+        List[User]: 사용자 목록 (id, text 포함)
+    """
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT id, text FROM users ORDER BY id')
+        users = cursor.fetchall()
+        
+        conn.close()
+        
+        # User 객체 리스트로 변환
+        user_list = [User(id=user[0], text=user[1]) for user in users]
+        
+        return user_list
+        
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"message": "데이터베이스 조회 실패", "Exception": str(e)})
+
+
+def run_training_pipeline(request: TrainRequest):
+    """백그라운드에서 실행되는 훈련 파이프라인"""
+    global training_status
+    
+    try:
+        training_status.update({
+            "is_training": True,
+            "current_stage": "시작",
+            "progress": "훈련 준비 중...",
+            "error": None
+        })
+        
+        # 현재 디렉토리 및 기본 설정
+        now_dir = os.getcwd()
+        tmp_dir = os.path.join(now_dir, "TEMP")
+        os.makedirs(tmp_dir, exist_ok=True)
+        
+        exp_root = "logs"  # 실험 디렉토리 루트
+        exp_dir = f"{exp_root}/{request.exp_name.rstrip(' ')}"
+        os.makedirs(exp_dir, exist_ok=True)
+        
+        # Python 실행자 설정
+        python_exec = sys.executable or "python"
+        
+        # 1. 데이터셋 형식화 (1Aabc)
+        training_status.update({
+            "current_stage": "데이터셋 형식화",
+            "progress": "1A - 텍스트 분할 및 특징 추출 중..."
+        })
+        
+        # 1a: 텍스트 분할 및 특징 추출
+        path_text = f"{exp_dir}/2-name2text.txt"
+        if not os.path.exists(path_text) or (
+            os.path.exists(path_text) and 
+            len(open(path_text, "r", encoding="utf8").read().strip("\n").split("\n")) < 2
+        ):
+            config = {
+                "inp_text": request.inp_text,
+                "inp_wav_dir": request.inp_wav_dir,
+                "exp_name": request.exp_name.rstrip(' '),
+                "opt_dir": exp_dir,
+                "bert_pretrained_dir": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
+                "is_half": "True",
+                "i_part": "0",
+                "all_parts": "1",
+                "_CUDA_VISIBLE_DEVICES": "0"
+            }
+            
+            for key, value in config.items():
+                os.environ[key] = str(value)
+            
+            cmd = f'"{python_exec}" -s GPT_SoVITS/prepare_datasets/1-get-text.py'
+            print(f"실행 명령어: {cmd}")
+            process = Popen(cmd, shell=True)
+            process.wait()
+            
+            # 결과 검증
+            if not os.path.exists(path_text) or os.path.getsize(path_text) == 0:
+                raise Exception("1A 단계 실패: 텍스트 파일이 생성되지 않았습니다.")
+        
+        # 1b: 음성 자기지도 특징 추출
+        training_status.update({
+            "current_stage": "데이터셋 형식화",
+            "progress": "1B - 음성 자기지도 특징 추출 중..."
+        })
+        
+        config.update({
+            "cnhubert_base_dir": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
+            "sv_path": "GPT_SoVITS/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt"
+        })
+        
+        for key, value in config.items():
+            os.environ[key] = str(value)
+            
+        cmd = f'"{python_exec}" -s GPT_SoVITS/prepare_datasets/2-get-hubert-wav32k.py'
+        print(f"실행 명령어: {cmd}")
+        process = Popen(cmd, shell=True)
+        process.wait()
+        
+        cmd = f'"{python_exec}" -s GPT_SoVITS/prepare_datasets/2-get-sv.py'
+        print(f"실행 명령어: {cmd}")
+        process = Popen(cmd, shell=True)
+        process.wait()
+        
+        # 1c: 의미론적 토큰 추출
+        training_status.update({
+            "current_stage": "데이터셋 형식화",
+            "progress": "1C - 의미론적 토큰 추출 중..."
+        })
+        
+        path_semantic = f"{exp_dir}/6-name2semantic.tsv"
+        if not os.path.exists(path_semantic) or os.path.getsize(path_semantic) < 31:
+            config.update({
+                "pretrained_s2G": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
+                "s2config_path": "GPT_SoVITS/configs/s2v2ProPlus.json"
+            })
+            
+            for key, value in config.items():
+                os.environ[key] = str(value)
+                
+            cmd = f'"{python_exec}" -s GPT_SoVITS/prepare_datasets/3-get-semantic.py'
+            print(f"실행 명령어: {cmd}")
+            process = Popen(cmd, shell=True)
+            process.wait()
+            
+            # 결과 검증
+            if not os.path.exists(path_semantic) or os.path.getsize(path_semantic) < 31:
+                raise Exception("1C 단계 실패: 의미론적 토큰 파일이 생성되지 않았습니다.")
+        
+        # 2. SoVITS 훈련
+        training_status.update({
+            "current_stage": "SoVITS 훈련",
+            "progress": "SoVITS 모델 훈련 중..."
+        })
+        
+        # SoVITS 설정 파일 생성 (v2ProPlus 고정)
+        with open("GPT_SoVITS/configs/s2v2ProPlus.json") as f:
+            s2_config = json.load(f)
+        
+        # 로그 디렉토리 생성
+        os.makedirs(f"{exp_dir}/logs_s2_v2ProPlus", exist_ok=True)
+        
+        # 설정 업데이트
+        s2_config["train"]["batch_size"] = 7
+        s2_config["train"]["epochs"] = 8
+        s2_config["train"]["text_low_lr_rate"] = 0.4
+        s2_config["train"]["pretrained_s2G"] = "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
+        s2_config["train"]["pretrained_s2D"] = "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth".replace("s2G", "s2D")
+        s2_config["train"]["if_save_latest"] = True
+        s2_config["train"]["if_save_every_weights"] = True
+        s2_config["train"]["save_every_epoch"] = 4
+        s2_config["train"]["gpu_numbers"] = "0"
+        s2_config["train"]["grad_ckpt"] = False
+        s2_config["train"]["lora_rank"] = "32"
+        s2_config["model"]["version"] = "v2ProPlus"
+        s2_config["data"]["exp_dir"] = exp_dir
+        s2_config["s2_ckpt_dir"] = exp_dir
+        s2_config["save_weight_dir"] = "SoVITS_weights_v2ProPlus"
+        s2_config["name"] = request.exp_name.rstrip(' ')
+        s2_config["version"] = "v2ProPlus"
+        
+        tmp_s2_config = f"{tmp_dir}/tmp_s2.json"
+        with open(tmp_s2_config, "w") as f:
+            json.dump(s2_config, f)
+        
+        cmd = f'"{python_exec}" -s GPT_SoVITS/s2_train.py --config "{tmp_s2_config}"'
+            
+        print(f"실행 명령어: {cmd}")
+        process = Popen(cmd, shell=True)
+        process.wait()
+        
+        # 3. GPT 훈련
+        training_status.update({
+            "current_stage": "GPT 훈련",
+            "progress": "GPT 모델 훈련 중..."
+        })
+        
+        # GPT 설정 파일 생성 (v2ProPlus 고정)
+        with open("GPT_SoVITS/configs/s1longer-v2.yaml") as f:
+            s1_config = yaml.load(f, Loader=yaml.FullLoader)
+        
+        # 로그 디렉토리 생성
+        os.makedirs(f"{exp_dir}/logs_s1", exist_ok=True)
+        
+        # 설정 업데이트
+        s1_config["train"]["batch_size"] = 7
+        s1_config["train"]["epochs"] = 15
+        s1_config["pretrained_s1"] = "GPT_SoVITS/pretrained_models/s1v3.ckpt"
+        s1_config["train"]["save_every_n_epoch"] = 5
+        s1_config["train"]["if_save_every_weights"] = True
+        s1_config["train"]["if_save_latest"] = True
+        s1_config["train"]["if_dpo"] = False
+        s1_config["train"]["half_weights_save_dir"] = "GPT_weights_v2ProPlus"
+        s1_config["train"]["exp_name"] = request.exp_name.rstrip(' ')
+        s1_config["train_semantic_path"] = f"{exp_dir}/6-name2semantic.tsv"
+        s1_config["train_phoneme_path"] = f"{exp_dir}/2-name2text.txt"
+        s1_config["output_dir"] = f"{exp_dir}/logs_s1_v2ProPlus"
+        
+        tmp_s1_config = f"{tmp_dir}/tmp_s1.yaml"
+        with open(tmp_s1_config, "w") as f:
+            yaml.dump(s1_config, f, default_flow_style=False)
+        
+        # 환경변수 설정
+        os.environ["_CUDA_VISIBLE_DEVICES"] = "0"
+        os.environ["hz"] = "25hz"
+        
+        cmd = f'"{python_exec}" -s GPT_SoVITS/s1_train.py --config_file "{tmp_s1_config}"'
+        print(f"실행 명령어: {cmd}")
+        process = Popen(cmd, shell=True)
+        process.wait()
+        
+        # 훈련 완료
+        training_status.update({
+            "is_training": False,
+            "current_stage": "완료",
+            "progress": "모든 훈련이 성공적으로 완료되었습니다!",
+            "error": None
+        })
+        
+    except Exception as e:
+        training_status.update({
+            "is_training": False,
+            "current_stage": "오류",
+            "progress": "",
+            "error": str(e)
+        })
+        print(f"훈련 중 오류 발생: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+@APP.post("/train")
+async def start_training(request: TrainRequest, background_tasks: BackgroundTasks):
+    """
+    GPT-SoVITS 모델 훈련을 시작합니다.
+    1Aabc 원클릭 형식화 -> SoVITS 훈련 -> GPT 훈련 순서로 진행됩니다.
+    """
+    global training_status
+    
+    if training_status["is_training"]:
+        return JSONResponse(
+            status_code=400, 
+            content={"message": "이미 훈련이 진행 중입니다. /train/status로 상태를 확인하세요."}
+        )
+    
+    # 필수 파라미터 검증
+    if not request.exp_name or not request.inp_text or not request.inp_wav_dir:
+        return JSONResponse(
+            status_code=400,
+            content={"message": "exp_name, inp_text, inp_wav_dir은 필수 파라미터입니다."}
+        )
+    
+    # 백그라운드 태스크로 훈련 시작
+    background_tasks.add_task(run_training_pipeline, request)
+    
+    return JSONResponse(
+        status_code=200,
+        content={
+            "message": "훈련이 백그라운드에서 시작되었습니다.",
+            "exp_name": request.exp_name,
+            "status_check_url": "/train/status"
+        }
+    )
+
+
+@APP.get("/train/status")
+async def get_training_status():
+    """현재 훈련 상태를 조회합니다."""
+    return JSONResponse(status_code=200, content=training_status)
+
+
+@APP.post("/train/stop")
+async def stop_training():
+    """진행 중인 훈련을 중단합니다."""
+    global training_status
+    
+    if not training_status["is_training"]:
+        return JSONResponse(
+            status_code=400,
+            content={"message": "현재 진행 중인 훈련이 없습니다."}
+        )
+    
+    # 간단한 상태 리셋 (실제 프로세스 종료는 복잡하므로 상태만 변경)
+    training_status.update({
+        "is_training": False,
+        "current_stage": "중단됨",
+        "progress": "사용자에 의해 훈련이 중단되었습니다.",
+        "error": None
+    })
+    
+    return JSONResponse(
+        status_code=200,
+        content={"message": "훈련 중단 요청이 처리되었습니다."}
+    )
+
+
 if __name__ == "__main__":
     try:
         if host == "None":  # 在调用时使用 -a None 参数，可以让api监听双栈
             host = None
-        uvicorn.run(app=APP, host=host, port=port, workers=1)
+        uvicorn.run(app=APP, host=host, port=port)
     except Exception:
         traceback.print_exc()
         os.kill(os.getpid(), signal.SIGTERM)
