@@ -1036,17 +1036,25 @@ async def stop_training():
 @APP.post("/upload/voice")
 async def upload_voice_files(
     exp_name: str = Form(...),
-    files: List[UploadFile] = File(...)
+    files: List[UploadFile] = File(...),
+    background_tasks: BackgroundTasks = None
 ):
     """
-    음성 파일들을 업로드합니다 (voice0.wav ~ voice9.wav).
+    음성 파일들을 업로드하고 WAV 형식으로 변환한 후 자동으로 훈련을 시작합니다.
     
     Args:
         exp_name: 실험명 (폴더명으로 사용됨)
-        files: 업로드할 음성 파일들 (voice0.wav ~ voice9.wav)
+        files: 업로드할 음성/비디오 파일들 
+               (MP4, AVI, MOV, MKV, FLV, MP3, M4A, AAC, OGG, WAV 지원)
+               MP4 등 비디오 파일은 자동으로 WAV로 변환됩니다.
+        background_tasks: FastAPI BackgroundTasks (자동 훈련 시작용)
     
     Returns:
-        업로드 결과 메시지
+        업로드, 변환 및 훈련 시작 결과 메시지
+        - MP4/비디오 파일: 자동으로 WAV로 변환 (22050Hz, 모노)
+        - WAV 파일: 그대로 저장
+        - 기타 오디오 파일: WAV로 변환
+        - 업로드 성공 시 자동으로 GPT-SoVITS 훈련 시작
     """
     try:
         # exp_name 검증
@@ -1070,37 +1078,87 @@ async def upload_voice_files(
         
         for file in files:
             try:
-                # 파일명 검증
-                if file.filename not in allowed_filenames:
-                    errors.append(f"파일명 '{file.filename}'은 허용되지 않습니다. voice0.wav ~ voice9.wav만 업로드 가능합니다.")
-                    continue
-                
-                # 파일 형식 검증 (WAV 확장자)
-                if not file.filename.lower().endswith('.wav'):
-                    errors.append(f"파일 '{file.filename}'은 WAV 형식이 아닙니다.")
-                    continue
-                
                 # 파일 크기 검증 (100MB 제한)
                 content = await file.read()
                 if len(content) > 100 * 1024 * 1024:  # 100MB
                     errors.append(f"파일 '{file.filename}'의 크기가 너무 큽니다 (최대 100MB).")
                     continue
                 
-                # Content-Type 검증 (선택적)
-                if file.content_type and not file.content_type.startswith('audio/'):
-                    errors.append(f"파일 '{file.filename}'의 형식이 올바르지 않습니다.")
+                # 파일 확장자 확인
+                original_filename = file.filename
+                file_extension = original_filename.lower().split('.')[-1] if '.' in original_filename else ''
+                
+                # 지원되는 형식인지 확인 (audio, video 모두 허용)
+                supported_extensions = ['wav', 'mp3', 'mp4', 'avi', 'mov', 'mkv', 'flv', 'm4a', 'aac', 'ogg']
+                if file_extension not in supported_extensions:
+                    errors.append(f"파일 '{original_filename}'의 형식이 지원되지 않습니다. 지원 형식: {', '.join(supported_extensions)}")
                     continue
                 
-                # 파일 저장
-                file_path = os.path.join(upload_dir, file.filename)
-                with open(file_path, "wb") as f:
+                # 임시 파일로 저장
+                temp_input_path = os.path.join(upload_dir, f"temp_{original_filename}")
+                with open(temp_input_path, "wb") as f:
                     f.write(content)
                 
-                uploaded_files.append(file.filename)
-                print(f"✅ 파일 업로드 완료: {file_path}")
+                # 최종 저장 파일명 생성 (확장자를 .wav로 변경)
+                final_filename = original_filename.rsplit('.', 1)[0] + '.wav' if '.' in original_filename else original_filename + '.wav'
+                final_file_path = os.path.join(upload_dir, final_filename)
                 
+                # WAV가 아닌 경우 변환, WAV인 경우 그대로 복사
+                if file_extension != 'wav':
+                    print(f"🔄 {file_extension.upper()} → WAV 변환 시작: {original_filename}")
+                    
+                    # ffmpeg를 사용해서 WAV로 변환
+                    ffmpeg_cmd = [
+                        "ffmpeg",
+                        "-i", temp_input_path,     # 입력 파일
+                        "-acodec", "pcm_s16le",    # 오디오 코덱: 16비트 PCM
+                        "-ar", "22050",            # 샘플링 레이트: 22050Hz (TTS에 적합)
+                        "-ac", "1",                # 모노 채널
+                        "-y",                      # 출력 파일 덮어쓰기
+                        final_file_path            # 출력 파일
+                    ]
+                    
+                    process = subprocess.run(
+                        ffmpeg_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=60  # 60초 타임아웃
+                    )
+                    
+                    if process.returncode != 0:
+                        errors.append(f"파일 '{original_filename}' 변환 실패: {process.stderr}")
+                        # 임시 파일 정리
+                        if os.path.exists(temp_input_path):
+                            os.remove(temp_input_path)
+                        continue
+                    
+                    print(f"✅ 변환 완료: {original_filename} → {final_filename}")
+                else:
+                    # WAV 파일인 경우 그대로 복사
+                    import shutil
+                    shutil.move(temp_input_path, final_file_path)
+                    print(f"✅ WAV 파일 저장: {final_filename}")
+                
+                # 임시 파일 정리
+                if os.path.exists(temp_input_path):
+                    os.remove(temp_input_path)
+                
+                uploaded_files.append(final_filename)
+                print(f"✅ 파일 처리 완료: {final_file_path}")
+                
+            except subprocess.TimeoutExpired:
+                errors.append(f"파일 '{file.filename}' 변환 시간 초과 (60초)")
+                # 임시 파일 정리
+                temp_path = os.path.join(upload_dir, f"temp_{file.filename}")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                continue
             except Exception as e:
-                errors.append(f"파일 '{file.filename}' 업로드 중 오류: {str(e)}")
+                errors.append(f"파일 '{file.filename}' 처리 중 오류: {str(e)}")
+                # 임시 파일 정리
+                temp_path = os.path.join(upload_dir, f"temp_{file.filename}")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
                 continue
         
         # slicer_opt.list 파일 생성
@@ -1174,6 +1232,29 @@ async def upload_voice_files(
         if errors:
             result["errors"] = errors
             result["message"] += f" {len(errors)}개 파일에서 오류가 발생했습니다."
+        
+        # 업로드가 성공했고 파일이 하나 이상 있으면 자동으로 훈련 시작
+        if uploaded_files and len(uploaded_files) == 10:
+            # 현재 훈련 중인지 확인
+            global training_status
+            if not training_status["is_training"]:
+                # 훈련 요청 객체 생성
+                train_request = TrainRequest(exp_name=exp_name)
+                
+                # 백그라운드에서 훈련 시작
+                if background_tasks:
+                    background_tasks.add_task(run_training_pipeline, train_request)
+                    result["training_started"] = True
+                    result["message"] += " 자동으로 훈련이 시작되었습니다."
+                    print(f"🚀 업로드 완료 후 자동 훈련 시작: {exp_name}")
+                else:
+                    result["training_started"] = False
+                    result["message"] += " 훈련 자동 시작을 위해서는 BackgroundTasks가 필요합니다."
+            else:
+                result["training_started"] = False
+                result["message"] += " 이미 다른 훈련이 진행 중입니다."
+        else:
+            result["training_started"] = False
         
         return JSONResponse(
             status_code=200 if uploaded_files else 400,
