@@ -1,103 +1,3 @@
-"""
-# WebAPI文档
-
-` python api_v2.py -a 127.0.0.1 -p 9880 -c GPT_SoVITS/configs/tts_infer.yaml `
-
-## 执行参数:
-    `-a` - `绑定地址, 默认"127.0.0.1"`
-    `-p` - `绑定端口, 默认9880`
-    `-c` - `TTS配置文件路径, 默认"GPT_SoVITS/configs/tts_infer.yaml"`
-
-## 调用:
-
-### 推理
-
-endpoint: `/tts`
-GET:
-```
-http://127.0.0.1:9880/tts?text=先帝创业未半而中道崩殂，今天下三分，益州疲弊，此诚危急存亡之秋也。&text_lang=zh&ref_audio_path=archive_jingyuan_1.wav&prompt_lang=zh&prompt_text=我是「罗浮」云骑将军景元。不必拘谨，「将军」只是一时的身份，你称呼我景元便可&text_split_method=cut5&batch_size=1&media_type=wav&streaming_mode=true
-```
-
-POST:
-```json
-{
-    "text": "",                   # str.(required) text to be synthesized
-    "text_lang: "",               # str.(required) language of the text to be synthesized
-    "ref_audio_path": "",         # str.(required) reference audio path
-    "aux_ref_audio_paths": [],    # list.(optional) auxiliary reference audio paths for multi-speaker tone fusion
-    "prompt_text": "",            # str.(optional) prompt text for the reference audio
-    "prompt_lang": "",            # str.(required) language of the prompt text for the reference audio
-    "top_k": 5,                   # int. top k sampling
-    "top_p": 1,                   # float. top p sampling
-    "temperature": 1,             # float. temperature for sampling
-    "text_split_method": "cut0",  # str. text split method, see text_segmentation_method.py for details.
-    "batch_size": 1,              # int. batch size for inference
-    "batch_threshold": 0.75,      # float. threshold for batch splitting.
-    "split_bucket: True,          # bool. whether to split the batch into multiple buckets.
-    "speed_factor":1.0,           # float. control the speed of the synthesized audio.
-    "streaming_mode": False,      # bool. whether to return a streaming response.
-    "seed": -1,                   # int. random seed for reproducibility.
-    "parallel_infer": True,       # bool. whether to use parallel inference.
-    "repetition_penalty": 1.35    # float. repetition penalty for T2S model.
-    "sample_steps": 32,           # int. number of sampling steps for VITS model V3.
-    "super_sampling": False,       # bool. whether to use super-sampling for audio when using VITS model V3.
-}
-```
-
-RESP:
-成功: 直接返回 wav 音频流， http code 200
-失败: 返回包含错误信息的 json, http code 400
-
-### 命令控制
-
-endpoint: `/control`
-
-command:
-"restart": 重新运行
-"exit": 结束运行
-
-GET:
-```
-http://127.0.0.1:9880/control?command=restart
-```
-POST:
-```json
-{
-    "command": "restart"
-}
-```
-
-RESP: 无
-
-
-### 切换GPT模型
-
-endpoint: `/set_gpt_weights`
-
-GET:
-```
-http://127.0.0.1:9880/set_gpt_weights?weights_path=GPT_SoVITS/pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt
-```
-RESP:
-成功: 返回"success", http code 200
-失败: 返回包含错误信息的 json, http code 400
-
-
-### 切换Sovits模型
-
-endpoint: `/set_sovits_weights`
-
-GET:
-```
-http://127.0.0.1:9880/set_sovits_weights?weights_path=GPT_SoVITS/pretrained_models/s2G488k.pth
-```
-
-RESP:
-成功: 返回"success", http code 200
-失败: 返回包含错误信息的 json, http code 400
-
-"""
-
 import os
 import sys
 import traceback
@@ -114,7 +14,7 @@ import signal
 import numpy as np
 import soundfile as sf
 import sqlite3
-from fastapi import FastAPI, Response, BackgroundTasks
+from fastapi import FastAPI, Response, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 from io import BytesIO
@@ -169,10 +69,9 @@ def init_database():
     cursor.execute('SELECT COUNT(*) FROM users')
     if cursor.fetchone()[0] == 0:
         test_users = [
-            ('김철수',),
-            ('박영희',),
-            ('이민수',),
-            ('정수진',)
+            ('kim',),
+            ('yeo12345',),
+            ('why',),
         ]
         cursor.executemany('INSERT INTO users (text) VALUES (?)', test_users)
     
@@ -191,8 +90,6 @@ class User(BaseModel):
 
 class TrainRequest(BaseModel):
     exp_name: Optional[str] = "test"
-    inp_text: Optional[str] = "GPT_SoVITS/output/asr_opt/slicer_opt.list"
-    inp_wav_dir: Optional[str] = f"GPT_SoVITS/user/0"
     
 # 훈련 상태 추적용 전역 변수
 training_status = {
@@ -205,7 +102,6 @@ training_status = {
 class TTS_Request(BaseModel):
     text: str = None
     text_lang: str = None
-    ref_audio_path: str = None
     aux_ref_audio_paths: list = None
     prompt_lang: str = None
     prompt_text: str = ""
@@ -225,6 +121,7 @@ class TTS_Request(BaseModel):
     repetition_penalty: float = 1.35
     sample_steps: int = 32
     super_sampling: bool = False
+    exp_name: str = "test"
 
 
 ### modify from https://github.com/RVC-Boss/GPT-SoVITS/pull/894/files
@@ -315,14 +212,11 @@ def handle_control(command: str):
 def check_params(req: dict):
     text: str = req.get("text", "")
     text_lang: str = req.get("text_lang", "")
-    ref_audio_path: str = req.get("ref_audio_path", "")
     streaming_mode: bool = req.get("streaming_mode", False)
     media_type: str = req.get("media_type", "wav")
     prompt_lang: str = req.get("prompt_lang", "")
     text_split_method: str = req.get("text_split_method", "cut5")
 
-    if ref_audio_path in [None, ""]:
-        return JSONResponse(status_code=400, content={"message": "ref_audio_path is required"})
     if text in [None, ""]:
         return JSONResponse(status_code=400, content={"message": "text is required"})
     if text_lang in [None, ""]:
@@ -361,7 +255,6 @@ async def tts_handle(req: dict):
             {
                 "text": "",                   # str.(required) text to be synthesized
                 "text_lang: "",               # str.(required) language of the text to be synthesized
-                "ref_audio_path": "",         # str.(required) reference audio path
                 "aux_ref_audio_paths": [],    # list.(optional) auxiliary reference audio paths for multi-speaker synthesis
                 "prompt_text": "",            # str.(optional) prompt text for the reference audio
                 "prompt_lang": "",            # str.(required) language of the prompt text for the reference audio
@@ -381,6 +274,7 @@ async def tts_handle(req: dict):
                 "repetition_penalty": 1.35    # float.(optional) repetition penalty for T2S model.
                 "sample_steps": 32,           # int. number of sampling steps for VITS model V3.
                 "super_sampling": False,       # bool. whether to use super-sampling for audio when using VITS model V3.
+                "exp_name": "",               # str.(required) experiment name to auto-load checkpoints and reference audio from GPT_SoVITS/user/{exp_name}/voice0.wav
             }
     returns:
         StreamingResponse: audio stream response.
@@ -389,10 +283,62 @@ async def tts_handle(req: dict):
     streaming_mode = req.get("streaming_mode", False)
     return_fragment = req.get("return_fragment", False)
     media_type = req.get("media_type", "wav")
+    exp_name = req.get("exp_name", "test")
 
     check_res = check_params(req)
     if check_res is not None:
         return check_res
+
+    # exp_name이 제공된 경우 해당 실험의 체크포인트 및 참조 음성을 자동으로 로드
+    if exp_name and exp_name.strip():
+        try:
+            user_model_dir = f"GPT_SoVITS/user/{exp_name.strip()}"
+            gpt_path = f"{user_model_dir}/{exp_name.strip()}.ckpt"
+            sovits_path = f"{user_model_dir}/{exp_name.strip()}.pth"
+            ref_audio_path = f"{user_model_dir}/voice0.wav"
+            
+            # 참조 음성 파일 존재 확인
+            if not os.path.exists(ref_audio_path):
+                return JSONResponse(
+                    status_code=400, 
+                    content={"message": f"참조 음성 파일을 찾을 수 없습니다: {ref_audio_path}"}
+                )
+            
+            # GPT 모델 체크포인트 존재 확인 및 로드
+            if os.path.exists(gpt_path):
+                print(f"🔄 GPT 모델 로드 중: {gpt_path}")
+                tts_pipeline.init_t2s_weights(gpt_path)
+            else:
+                return JSONResponse(
+                    status_code=400, 
+                    content={"message": f"GPT 체크포인트를 찾을 수 없습니다: {gpt_path}"}
+                )
+            
+            # SoVITS 모델 체크포인트 존재 확인 및 로드
+            if os.path.exists(sovits_path):
+                print(f"🔄 SoVITS 모델 로드 중: {sovits_path}")
+                tts_pipeline.init_vits_weights(sovits_path)
+            else:
+                return JSONResponse(
+                    status_code=400, 
+                    content={"message": f"SoVITS 체크포인트를 찾을 수 없습니다: {sovits_path}"}
+                )
+            
+            # req에 참조 음성 경로 자동 설정
+            req["ref_audio_path"] = ref_audio_path
+            print(f"🎤 참조 음성 설정: {ref_audio_path}")
+            print(f"✅ {exp_name} 실험의 모델들이 성공적으로 로드되었습니다.")
+            
+        except Exception as e:
+            return JSONResponse(
+                status_code=400, 
+                content={"message": f"모델 로드 실패", "Exception": str(e)}
+            )
+    else:
+        return JSONResponse(
+            status_code=400,
+            content={"message": "exp_name은 필수 파라미터입니다."}
+        )
 
     if streaming_mode or return_fragment:
         req["return_fragment"] = True
@@ -439,7 +385,6 @@ async def control(command: str = None):
 async def tts_get_endpoint(
     text: str = None,
     text_lang: str = None,
-    ref_audio_path: str = None,
     aux_ref_audio_paths: list = None,
     prompt_lang: str = None,
     prompt_text: str = "",
@@ -459,11 +404,11 @@ async def tts_get_endpoint(
     repetition_penalty: float = 1.35,
     sample_steps: int = 32,
     super_sampling: bool = False,
+    exp_name: str = "test",
 ):
     req = {
         "text": text,
         "text_lang": text_lang.lower(),
-        "ref_audio_path": ref_audio_path,
         "aux_ref_audio_paths": aux_ref_audio_paths,
         "prompt_text": prompt_text,
         "prompt_lang": prompt_lang.lower(),
@@ -483,6 +428,7 @@ async def tts_get_endpoint(
         "repetition_penalty": float(repetition_penalty),
         "sample_steps": int(sample_steps),
         "super_sampling": super_sampling,
+        "exp_name": exp_name,
     }
     return await tts_handle(req)
 
@@ -571,47 +517,44 @@ async def get_users():
 
 
 def cleanup_experiment_files(exp_dir: str, tmp_dir: str, exp_name: str):
-    """훈련 완료 후 불필요한 파일들 정리 및 최적 모델 파일명 변경"""
+    """훈련 완료 후 최적 모델 선별 및 GPT_SoVITS/user/{exp_name}/ 폴더에 저장"""
     import shutil
     import glob
     import re
     
     try:
-        print(f"🗑️ 실험 파일 정리 및 모델 파일명 변경 시작: {exp_name}")
+        print(f"🎯 최적 모델 선별 및 저장 시작: {exp_name}")
         
-        # 1. 최적 모델 파일 이름 변경
-        rename_best_model_files(exp_name)
+        # 1. 최적 모델 선별 및 저장
+        save_best_models_to_user_folder(exp_name, exp_dir)
         
-        # 2. 실험 디렉토리 전체 삭제
-        if os.path.exists(exp_dir):
-            shutil.rmtree(exp_dir)
-            print(f"✅ 삭제 완료: {exp_dir}")
+        # 2. 모든 실험 파일 정리 (logs 디렉토리)
+        cleanup_all_experiment_files(exp_dir)
         
         # 3. 임시 파일들 삭제
-        temp_files = [
-            f"{tmp_dir}/tmp_s2.json",
-            f"{tmp_dir}/tmp_s1.yaml"
-        ]
-        for temp_file in temp_files:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-                print(f"✅ 삭제 완료: {temp_file}")
+        cleanup_temp_files(tmp_dir)
         
-        print(f"🎉 정리 완료! {exp_name} 최적 모델 파일들이 준비되었습니다.")
+        print(f"🎉 완료! {exp_name} 최적 모델이 GPT_SoVITS/user/{exp_name}/에 저장되었습니다.")
         
     except Exception as e:
         print(f"⚠️ 정리 중 오류: {e}")
 
 
-def rename_best_model_files(exp_name: str):
-    """가장 성능이 좋은 모델 파일들을 exp_name으로 이름 변경"""
+def save_best_models_to_user_folder(exp_name: str, exp_dir: str):
+    """최적 모델들을 GPT_SoVITS/user/{exp_name}/ 폴더에 저장"""
+    import shutil
+    import glob
+    import re
+    
     try:
-        print(f"🔄 최적 모델 파일 이름 변경 중: {exp_name}")
+        # 사용자 폴더 생성
+        user_folder = f"GPT_SoVITS/user/{exp_name}"
+        os.makedirs(user_folder, exist_ok=True)
+        print(f"📁 사용자 폴더 생성: {user_folder}")
         
-        # SoVITS 모델 파일 처리
-        sovits_dir = "SoVITS_weights_v2ProPlus"
+        # 1. SoVITS 최적 모델 찾기 및 저장
+        sovits_dir = f"{exp_dir}/SoVITS_weights"
         if os.path.exists(sovits_dir):
-            # 가장 높은 에포크의 메인 모델 찾기
             sovits_pattern = f"{sovits_dir}/{exp_name}_e*_s*.pth"
             sovits_files = glob.glob(sovits_pattern)
             
@@ -624,24 +567,16 @@ def rename_best_model_files(exp_name: str):
                     return (0, 0)
                 
                 best_sovits = max(sovits_files, key=extract_epoch_step)
-                new_sovits_name = f"{sovits_dir}/{exp_name}.pth"
+                final_sovits_path = f"{user_folder}/{exp_name}.pth"
                 
-                if os.path.exists(new_sovits_name):
-                    os.remove(new_sovits_name)
-                os.rename(best_sovits, new_sovits_name)
-                print(f"✅ SoVITS 모델: {best_sovits} → {new_sovits_name}")
-                
-                # LoRA 파일들은 TTS 추론에 불필요하므로 삭제
-                lora_pattern = f"{sovits_dir}/{exp_name}_e*_s*_lora.ckpt"
-                lora_files = glob.glob(lora_pattern)
-                for lora_file in lora_files:
-                    os.remove(lora_file)
-                    print(f"🗑️ LoRA 파일 삭제 (추론에 불필요): {lora_file}")
+                shutil.copy2(best_sovits, final_sovits_path)
+                print(f"✅ SoVITS 최적 모델 저장: {best_sovits} → {final_sovits_path}")
+            else:
+                print(f"⚠️ SoVITS 훈련 모델을 찾을 수 없습니다: {sovits_pattern}")
         
-        # GPT 모델 파일 처리
-        gpt_dir = "GPT_weights_v2ProPlus"
+        # 2. GPT 최적 모델 찾기 및 저장
+        gpt_dir = f"{exp_dir}/GPT_weights"
         if os.path.exists(gpt_dir):
-            # 가장 높은 에포크의 모델 찾기
             gpt_pattern = f"{gpt_dir}/{exp_name}-e*.ckpt"
             gpt_files = glob.glob(gpt_pattern)
             
@@ -654,54 +589,101 @@ def rename_best_model_files(exp_name: str):
                     return 0
                 
                 best_gpt = max(gpt_files, key=extract_gpt_epoch)
-                new_gpt_name = f"{gpt_dir}/{exp_name}.ckpt"
+                final_gpt_path = f"{user_folder}/{exp_name}.ckpt"
                 
-                if os.path.exists(new_gpt_name):
-                    os.remove(new_gpt_name)
-                os.rename(best_gpt, new_gpt_name)
-                print(f"✅ GPT 모델: {best_gpt} → {new_gpt_name}")
+                shutil.copy2(best_gpt, final_gpt_path)
+                print(f"✅ GPT 최적 모델 저장: {best_gpt} → {final_gpt_path}")
+            else:
+                print(f"⚠️ GPT 훈련 모델을 찾을 수 없습니다: {gpt_pattern}")
         
-        # 중간 체크포인트 파일들 정리 (선택사항)
-        cleanup_intermediate_checkpoints(exp_name)
+        # 3. 루트 디렉토리에서도 모델 찾기 (기존 훈련된 모델이 있을 경우)
+        root_gpt_pattern = f"GPT_weights_v2ProPlus/{exp_name}-e*.ckpt"
+        root_gpt_files = glob.glob(root_gpt_pattern)
         
+        if root_gpt_files and not gpt_files:  # exp_dir에 없고 루트에만 있는 경우
+            def extract_gpt_epoch(filepath):
+                match = re.search(r'-e(\d+)\.ckpt$', filepath)
+                if match:
+                    return int(match.group(1))
+                return 0
+            
+            best_root_gpt = max(root_gpt_files, key=extract_gpt_epoch)
+            final_gpt_path = f"{user_folder}/{exp_name}.ckpt"
+            
+            shutil.copy2(best_root_gpt, final_gpt_path)
+            print(f"✅ 루트 GPT 모델 복사: {best_root_gpt} → {final_gpt_path}")
+            
     except Exception as e:
-        print(f"⚠️ 모델 파일 이름 변경 중 오류: {e}")
+        print(f"⚠️ 최적 모델 저장 중 오류: {e}")
 
 
-def cleanup_intermediate_checkpoints(exp_name: str):
-    """중간 체크포인트 파일들 정리 (최종 모델만 남기고 삭제)"""
+def cleanup_all_experiment_files(exp_dir: str):
+    """실험 디렉토리 전체 삭제"""
+    import shutil
+    
     try:
-        # SoVITS 중간 파일들 삭제
-        sovits_dir = "SoVITS_weights_v2ProPlus"
-        if os.path.exists(sovits_dir):
-            for file in os.listdir(sovits_dir):
-                if (exp_name in file and 
-                    (file.endswith('.pth') or file.endswith('.ckpt')) and
-                    file != f"{exp_name}.pth"):  # 메인 모델 파일만 보존
-                    file_path = f"{sovits_dir}/{file}"
-                    os.remove(file_path)
-                    print(f"🗑️ 중간 파일 삭제: {file_path}")
+        if os.path.exists(exp_dir):
+            shutil.rmtree(exp_dir)
+            print(f"🗑️ 실험 디렉토리 삭제: {exp_dir}")
         
-        # GPT 중간 파일들 삭제
-        gpt_dir = "GPT_weights_v2ProPlus"
-        if os.path.exists(gpt_dir):
-            for file in os.listdir(gpt_dir):
-                if (exp_name in file and 
-                    file.endswith('.ckpt') and
-                    file != f"{exp_name}.ckpt"):
-                    file_path = f"{gpt_dir}/{file}"
-                    os.remove(file_path)
-                    print(f"🗑️ 중간 파일 삭제: {file_path}")
-                    
-        print("✅ 중간 체크포인트 파일들 정리 완료")
-        
+        # 루트 디렉토리의 모든 중간 모델들도 정리
+        cleanup_root_intermediate_files()
+            
     except Exception as e:
-        print(f"⚠️ 중간 파일 정리 중 오류: {e}")
+        print(f"⚠️ 실험 파일 삭제 중 오류: {e}")
+
+
+def cleanup_root_intermediate_files():
+    """루트 디렉토리의 중간 훈련 파일들 정리"""
+    import glob
+    
+    try:
+        # GPT 중간 모델들 삭제 (exp_name-e*.ckpt 형태)
+        gpt_files = glob.glob("GPT_weights_v2ProPlus/*-e*.ckpt")
+        for gpt_file in gpt_files:
+            os.remove(gpt_file)
+            print(f"🗑️ GPT 중간 모델 삭제: {gpt_file}")
+        
+        # SoVITS 중간 모델들 삭제 (exp_name_e*_s*.pth 형태)
+        sovits_files = glob.glob("SoVITS_weights_v2ProPlus/*_e*_s*.pth")
+        for sovits_file in sovits_files:
+            os.remove(sovits_file)
+            print(f"🗑️ SoVITS 중간 모델 삭제: {sovits_file}")
+        
+        # LoRA 파일들 삭제
+        lora_files = glob.glob("SoVITS_weights_v2ProPlus/*_lora.ckpt")
+        for lora_file in lora_files:
+            os.remove(lora_file)
+            print(f"🗑️ LoRA 파일 삭제: {lora_file}")
+            
+    except Exception as e:
+        print(f"⚠️ 루트 중간 파일 정리 중 오류: {e}")
+
+
+def cleanup_temp_files(tmp_dir: str):
+    """임시 파일들 삭제"""
+    try:
+        temp_files = [
+            f"{tmp_dir}/tmp_s2.json",
+            f"{tmp_dir}/tmp_s1.yaml"
+        ]
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+                print(f"✅ 임시 파일 삭제: {temp_file}")
+                
+    except Exception as e:
+        print(f"⚠️ 임시 파일 삭제 중 오류: {e}")
 
 
 def run_training_pipeline(request: TrainRequest):
     """백그라운드에서 실행되는 훈련 파이프라인"""
     global training_status
+    
+    # 변수 초기화 (finally 블록에서 사용하기 위해)
+    exp_name = None
+    exp_dir = None
+    tmp_dir = None
     
     try:
         training_status.update({
@@ -722,6 +704,22 @@ def run_training_pipeline(request: TrainRequest):
         exp_dir = f"{exp_root}/{exp_name}"
         os.makedirs(exp_dir, exist_ok=True)
         
+        # 훈련에 필요한 모든 디렉토리 미리 생성
+        required_dirs = [
+            f"{exp_dir}/SoVITS_weights",
+            f"{exp_dir}/GPT_weights", 
+            f"{exp_dir}/logs_s1",
+            f"{exp_dir}/logs_s2_v2ProPlus",
+            f"GPT_SoVITS/user/{exp_name}"  # 입력 음성 파일 디렉토리도 생성
+        ]
+        for dir_path in required_dirs:
+            os.makedirs(dir_path, exist_ok=True)
+            print(f"📁 디렉토리 생성: {dir_path}")
+        
+        # 내부적으로 경로 설정
+        inp_text = f"GPT_SoVITS/user/{exp_name}/slicer_opt.list"  # 고정 기본값 사용
+        inp_wav_dir = f"GPT_SoVITS/user/{exp_name}"  # exp_name에 따라 자동 설정
+        
         # Python 실행자 설정
         python_exec = sys.executable or "python"
         
@@ -738,8 +736,8 @@ def run_training_pipeline(request: TrainRequest):
             len(open(path_text, "r", encoding="utf8").read().strip("\n").split("\n")) < 2
         ):
             config = {
-                "inp_text": request.inp_text,
-                "inp_wav_dir": request.inp_wav_dir,
+                "inp_text": inp_text,
+                "inp_wav_dir": inp_wav_dir,
                 "exp_name": exp_name,
                 "opt_dir": exp_dir,
                 "bert_pretrained_dir": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
@@ -858,8 +856,9 @@ def run_training_pipeline(request: TrainRequest):
         with open("GPT_SoVITS/configs/s2v2ProPlus.json") as f:
             s2_config = json.load(f)
         
-        # 로그 디렉토리 생성
+        # 로그 및 모델 저장 디렉토리 생성
         os.makedirs(f"{exp_dir}/logs_s2_v2ProPlus", exist_ok=True)
+        os.makedirs(f"{exp_dir}/SoVITS_weights", exist_ok=True)
         
         # 설정 업데이트
         s2_config["train"]["batch_size"] = 7
@@ -876,7 +875,7 @@ def run_training_pipeline(request: TrainRequest):
         s2_config["model"]["version"] = "v2ProPlus"
         s2_config["data"]["exp_dir"] = exp_dir
         s2_config["s2_ckpt_dir"] = exp_dir
-        s2_config["save_weight_dir"] = "SoVITS_weights_v2ProPlus"
+        s2_config["save_weight_dir"] = f"{exp_dir}/SoVITS_weights"  # 실험 디렉토리 안으로 통합
         s2_config["name"] = exp_name
         s2_config["version"] = "v2ProPlus"
         
@@ -900,8 +899,9 @@ def run_training_pipeline(request: TrainRequest):
         with open("GPT_SoVITS/configs/s1longer-v2.yaml") as f:
             s1_config = yaml.load(f, Loader=yaml.FullLoader)
         
-        # 로그 디렉토리 생성
+        # 로그 및 모델 저장 디렉토리 생성  
         os.makedirs(f"{exp_dir}/logs_s1", exist_ok=True)
+        os.makedirs(f"{exp_dir}/GPT_weights", exist_ok=True)
         
         # 설정 업데이트
         s1_config["train"]["batch_size"] = 7
@@ -911,7 +911,7 @@ def run_training_pipeline(request: TrainRequest):
         s1_config["train"]["if_save_every_weights"] = True
         s1_config["train"]["if_save_latest"] = True
         s1_config["train"]["if_dpo"] = False
-        s1_config["train"]["half_weights_save_dir"] = "GPT_weights_v2ProPlus"
+        s1_config["train"]["half_weights_save_dir"] = f"{exp_dir}/GPT_weights"  # 실험 디렉토리 안으로 통합
         s1_config["train"]["exp_name"] = exp_name
         s1_config["train_semantic_path"] = f"{exp_dir}/6-name2semantic.tsv"
         s1_config["train_phoneme_path"] = f"{exp_dir}/2-name2text.txt"
@@ -929,15 +929,6 @@ def run_training_pipeline(request: TrainRequest):
         print(f"실행 명령어: {cmd}")
         process = Popen(cmd, shell=True)
         process.wait()
-        
-        # 훈련 완료 후 정리 작업 (선택사항)
-        training_status.update({
-            "current_stage": "정리 작업",
-            "progress": "훈련 파일 정리 중..."
-        })
-        
-        # 실험 디렉토리 정리 (주석 해제하면 자동 삭제)
-        cleanup_experiment_files(exp_dir, tmp_dir, exp_name)
         
         # 훈련 완료
         training_status.update({
@@ -957,6 +948,21 @@ def run_training_pipeline(request: TrainRequest):
         print(f"훈련 중 오류 발생: {e}")
         import traceback
         traceback.print_exc()
+        
+    finally:
+        # 성공/실패 여부와 관계없이 파일 정리 작업 진행
+        if exp_name and exp_dir and tmp_dir:
+            try:
+                training_status.update({
+                    "current_stage": "정리 작업",
+                    "progress": "훈련 파일 정리 중..."
+                })
+                print(f"🧹 파일 정리 작업 시작 (성공/실패 무관): {exp_name}")
+                cleanup_experiment_files(exp_dir, tmp_dir, exp_name)
+            except Exception as cleanup_error:
+                print(f"⚠️ 파일 정리 중 오류 (무시하고 계속): {cleanup_error}")
+                import traceback
+                traceback.print_exc()
 
 
 @APP.post("/train")
@@ -974,10 +980,10 @@ async def start_training(request: TrainRequest, background_tasks: BackgroundTask
         )
     
     # 필수 파라미터 검증
-    if not request.exp_name or not request.inp_text or not request.inp_wav_dir:
+    if not request.exp_name:
         return JSONResponse(
             status_code=400,
-            content={"message": "exp_name, inp_text, inp_wav_dir은 필수 파라미터입니다."}
+            content={"message": "exp_name은 필수 파라미터입니다."}
         )
     
     # 백그라운드 태스크로 훈련 시작
@@ -988,6 +994,9 @@ async def start_training(request: TrainRequest, background_tasks: BackgroundTask
         content={
             "message": "훈련이 백그라운드에서 시작되었습니다.",
             "exp_name": request.exp_name,
+            "inp_text": f"GPT_SoVITS/user/{request.exp_name}/slicer_opt.list",
+            "inp_wav_dir": f"GPT_SoVITS/user/{request.exp_name}",
+            "output_folder": f"GPT_SoVITS/user/{request.exp_name}",
             "status_check_url": "/train/status"
         }
     )
@@ -1022,6 +1031,163 @@ async def stop_training():
         status_code=200,
         content={"message": "훈련 중단 요청이 처리되었습니다."}
     )
+
+
+@APP.post("/upload/voice")
+async def upload_voice_files(
+    exp_name: str = Form(...),
+    files: List[UploadFile] = File(...)
+):
+    """
+    음성 파일들을 업로드합니다 (voice0.wav ~ voice9.wav).
+    
+    Args:
+        exp_name: 실험명 (폴더명으로 사용됨)
+        files: 업로드할 음성 파일들 (voice0.wav ~ voice9.wav)
+    
+    Returns:
+        업로드 결과 메시지
+    """
+    try:
+        # exp_name 검증
+        if not exp_name or not exp_name.strip():
+            return JSONResponse(
+                status_code=400,
+                content={"message": "exp_name은 필수 파라미터입니다."}
+            )
+        
+        exp_name = exp_name.strip()
+        
+        # 업로드 디렉토리 생성
+        upload_dir = f"GPT_SoVITS/user/{exp_name}"
+        os.makedirs(upload_dir, exist_ok=True)
+        
+        # 허용된 파일명 목록
+        allowed_filenames = [f"voice{i}.wav" for i in range(10)]  # voice0.wav ~ voice9.wav
+        
+        uploaded_files = []
+        errors = []
+        
+        for file in files:
+            try:
+                # 파일명 검증
+                if file.filename not in allowed_filenames:
+                    errors.append(f"파일명 '{file.filename}'은 허용되지 않습니다. voice0.wav ~ voice9.wav만 업로드 가능합니다.")
+                    continue
+                
+                # 파일 형식 검증 (WAV 확장자)
+                if not file.filename.lower().endswith('.wav'):
+                    errors.append(f"파일 '{file.filename}'은 WAV 형식이 아닙니다.")
+                    continue
+                
+                # 파일 크기 검증 (100MB 제한)
+                content = await file.read()
+                if len(content) > 100 * 1024 * 1024:  # 100MB
+                    errors.append(f"파일 '{file.filename}'의 크기가 너무 큽니다 (최대 100MB).")
+                    continue
+                
+                # Content-Type 검증 (선택적)
+                if file.content_type and not file.content_type.startswith('audio/'):
+                    errors.append(f"파일 '{file.filename}'의 형식이 올바르지 않습니다.")
+                    continue
+                
+                # 파일 저장
+                file_path = os.path.join(upload_dir, file.filename)
+                with open(file_path, "wb") as f:
+                    f.write(content)
+                
+                uploaded_files.append(file.filename)
+                print(f"✅ 파일 업로드 완료: {file_path}")
+                
+            except Exception as e:
+                errors.append(f"파일 '{file.filename}' 업로드 중 오류: {str(e)}")
+                continue
+        
+        # slicer_opt.list 파일 생성
+        try:
+            template_path = "GPT_SoVITS/user/slicer_opt.list"
+            target_path = f"{upload_dir}/slicer_opt.list"
+            
+            if os.path.exists(template_path):
+                with open(template_path, "r", encoding="utf-8") as f:
+                    template_content = f.read()
+                
+                # {} 부분을 exp_name으로 치환
+                updated_content = template_content.replace("{}", exp_name)
+                
+                # 새로운 slicer_opt.list 파일 생성
+                with open(target_path, "w", encoding="utf-8") as f:
+                    f.write(updated_content)
+                
+                print(f"✅ slicer_opt.list 파일 생성 완료: {target_path}")
+            else:
+                print(f"⚠️ 템플릿 파일을 찾을 수 없습니다: {template_path}")
+                
+        except Exception as e:
+            errors.append(f"slicer_opt.list 파일 생성 중 오류: {str(e)}")
+            print(f"⚠️ slicer_opt.list 파일 생성 실패: {e}")
+        
+        # 데이터베이스에 exp_name 추가
+        db_added = False
+        try:
+            conn = sqlite3.connect('users.db')
+            cursor = conn.cursor()
+            
+            # 중복 체크
+            cursor.execute('SELECT COUNT(*) FROM users WHERE text = ?', (exp_name,))
+            if cursor.fetchone()[0] == 0:
+                # 중복되지 않는 경우에만 추가
+                cursor.execute('INSERT INTO users (text) VALUES (?)', (exp_name,))
+                conn.commit()
+                db_added = True
+                print(f"✅ 데이터베이스에 exp_name 추가 완료: {exp_name}")
+            else:
+                print(f"ℹ️ exp_name이 이미 데이터베이스에 존재함: {exp_name}")
+                db_added = False  # 이미 존재하는 경우
+            
+            conn.close()
+            
+        except Exception as e:
+            errors.append(f"데이터베이스 추가 중 오류: {str(e)}")
+            print(f"⚠️ 데이터베이스 추가 실패: {e}")
+            db_added = False
+        
+        # 결과 반환
+        result = {
+            "message": f"{len(uploaded_files)}개 파일이 성공적으로 업로드되었습니다.",
+            "exp_name": exp_name,
+            "upload_dir": upload_dir,
+            "uploaded_files": uploaded_files,
+        }
+        
+        # slicer_opt.list 파일 생성 여부 확인
+        slicer_path = f"{upload_dir}/slicer_opt.list"
+        if os.path.exists(slicer_path):
+            result["slicer_opt_created"] = True
+            result["slicer_opt_path"] = slicer_path
+        else:
+            result["slicer_opt_created"] = False
+        
+        # 데이터베이스 추가 결과 포함
+        result["db_added"] = db_added
+        
+        if errors:
+            result["errors"] = errors
+            result["message"] += f" {len(errors)}개 파일에서 오류가 발생했습니다."
+        
+        return JSONResponse(
+            status_code=200 if uploaded_files else 400,
+            content=result
+        )
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "message": "파일 업로드 중 오류가 발생했습니다.",
+                "Exception": str(e)
+            }
+        )
 
 
 if __name__ == "__main__":
