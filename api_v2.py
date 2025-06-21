@@ -1067,7 +1067,26 @@ def run_training_pipeline(request: TrainRequest):
         process = Popen(cmd, shell=True)
         process.wait()
         
-        # 훈련 완료
+        # 훈련 완료 - 데이터베이스에 exp_name 추가
+        try:
+            conn = sqlite3.connect('users.db')
+            cursor = conn.cursor()
+            
+            # 중복 체크
+            cursor.execute('SELECT COUNT(*) FROM users WHERE text = ?', (exp_name,))
+            if cursor.fetchone()[0] == 0:
+                # 중복되지 않는 경우에만 추가
+                cursor.execute('INSERT INTO users (text) VALUES (?)', (exp_name,))
+                conn.commit()
+                print(f"✅ 훈련 완료 후 데이터베이스에 exp_name 추가 완료: {exp_name}")
+            else:
+                print(f"ℹ️ exp_name이 이미 데이터베이스에 존재함: {exp_name}")
+            
+            conn.close()
+            
+        except Exception as db_error:
+            print(f"⚠️ 데이터베이스 추가 실패 (훈련은 성공): {db_error}")
+        
         training_status.update({
             "is_training": False,
             "current_stage": "완료", 
@@ -1322,30 +1341,7 @@ async def upload_voice_files(
             errors.append(f"slicer_opt.list 파일 생성 중 오류: {str(e)}")
             print(f"⚠️ slicer_opt.list 파일 생성 실패: {e}")
         
-        # 데이터베이스에 exp_name 추가
-        db_added = False
-        try:
-            conn = sqlite3.connect('users.db')
-            cursor = conn.cursor()
-            
-            # 중복 체크
-            cursor.execute('SELECT COUNT(*) FROM users WHERE text = ?', (exp_name,))
-            if cursor.fetchone()[0] == 0:
-                # 중복되지 않는 경우에만 추가
-                cursor.execute('INSERT INTO users (text) VALUES (?)', (exp_name,))
-                conn.commit()
-                db_added = True
-                print(f"✅ 데이터베이스에 exp_name 추가 완료: {exp_name}")
-            else:
-                print(f"ℹ️ exp_name이 이미 데이터베이스에 존재함: {exp_name}")
-                db_added = False  # 이미 존재하는 경우
-            
-            conn.close()
-            
-        except Exception as e:
-            errors.append(f"데이터베이스 추가 중 오류: {str(e)}")
-            print(f"⚠️ 데이터베이스 추가 실패: {e}")
-            db_added = False
+        # 데이터베이스 추가는 훈련 완료 시점으로 이동됨
         
         # 결과 반환
         result = {
@@ -1363,8 +1359,7 @@ async def upload_voice_files(
         else:
             result["slicer_opt_created"] = False
         
-        # 데이터베이스 추가 결과 포함
-        result["db_added"] = db_added
+        # 데이터베이스는 훈련 완료 후 자동 추가됨
         
         if errors:
             result["errors"] = errors
