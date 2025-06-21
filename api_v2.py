@@ -54,29 +54,38 @@ APP = FastAPI()
 
 # SQLite 데이터베이스 초기화
 def init_database():
+    # 기존 데이터베이스 파일이 있으면 삭제
+    if os.path.exists('users.db'):
+        os.remove('users.db')
+        print("🗑️ 기존 데이터베이스 파일 삭제: users.db")
+    
+    # 새로운 데이터베이스 생성 및 연결
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
+    print("📝 새로운 데이터베이스 파일 생성: users.db")
     
     # users 테이블 생성
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
+        CREATE TABLE users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT NOT NULL
         )
     ''')
+    print("📋 users 테이블 생성 완료")
     
-    # 테스트 데이터 삽입 (테이블이 비어있을 경우)
-    cursor.execute('SELECT COUNT(*) FROM users')
-    if cursor.fetchone()[0] == 0:
-        test_users = [
-            ('kim',),
-            ('yeo12345',),
-            ('why',),
-        ]
-        cursor.executemany('INSERT INTO users (text) VALUES (?)', test_users)
+    # 테스트 데이터 삽입
+    test_users = [
+        ('ShinJjang',),
+        ('MoDongSoop',),
+        ('DrPark',),
+        ('EJKim',),
+    ]
+    cursor.executemany('INSERT INTO users (text) VALUES (?)', test_users)
+    print(f"✅ 테스트 데이터 {len(test_users)}개 삽입 완료")
     
     conn.commit()
     conn.close()
+    print("🎉 데이터베이스 초기화 완료!")
 
 # 데이터베이스 초기화 (--init-db 인자가 있을 때만)
 if args.init_db:
@@ -514,6 +523,134 @@ async def get_users():
         
     except Exception as e:
         return JSONResponse(status_code=500, content={"message": "데이터베이스 조회 실패", "Exception": str(e)})
+
+
+@APP.delete("/users/{user_id}")
+async def delete_user_by_id(user_id: int):
+    """
+    ID로 사용자를 삭제합니다. (데이터베이스에서만 삭제, 파일은 보존)
+    
+    Args:
+        user_id (int): 삭제할 사용자의 ID
+        
+    Returns:
+        성공/실패 메시지
+    """
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        # 먼저 사용자가 존재하는지 확인
+        cursor.execute('SELECT id, text FROM users WHERE id = ?', (user_id,))
+        user = cursor.fetchone()
+        
+        if not user:
+            conn.close()
+            return JSONResponse(
+                status_code=404, 
+                content={"message": f"ID {user_id}에 해당하는 사용자를 찾을 수 없습니다."}
+            )
+        
+        user_text = user[1]
+        
+        # 사용자 삭제
+        cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
+        deleted_count = cursor.rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        if deleted_count > 0:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "message": "사용자가 성공적으로 삭제되었습니다.",
+                    "deleted_user": {
+                        "id": user_id,
+                        "text": user_text
+                    },
+                    "note": f"파일은 보존됩니다: GPT_SoVITS/user/{user_text}/"
+                }
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={"message": "사용자 삭제에 실패했습니다."}
+            )
+            
+    except Exception as e:
+        return JSONResponse(
+            status_code=500, 
+            content={"message": "사용자 삭제 중 오류가 발생했습니다.", "Exception": str(e)}
+        )
+
+
+@APP.delete("/users")
+async def delete_user_by_text(text: str):
+    """
+    텍스트(exp_name)로 사용자를 삭제합니다. (데이터베이스에서만 삭제, 파일은 보존)
+    
+    Args:
+        text (str): 삭제할 사용자의 텍스트(실험명)
+        
+    Returns:
+        성공/실패 메시지
+    """
+    try:
+        if not text or not text.strip():
+            return JSONResponse(
+                status_code=400,
+                content={"message": "text 파라미터는 필수입니다."}
+            )
+        
+        text = text.strip()
+        
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        # 먼저 사용자가 존재하는지 확인
+        cursor.execute('SELECT id, text FROM users WHERE text = ?', (text,))
+        user = cursor.fetchone()
+        
+        if not user:
+            conn.close()
+            return JSONResponse(
+                status_code=404, 
+                content={"message": f"'{text}'에 해당하는 사용자를 찾을 수 없습니다."}
+            )
+        
+        user_id = user[0]
+        
+        # 사용자 삭제
+        cursor.execute('DELETE FROM users WHERE text = ?', (text,))
+        deleted_count = cursor.rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        if deleted_count > 0:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "message": "사용자가 성공적으로 삭제되었습니다.",
+                    "deleted_user": {
+                        "id": user_id,
+                        "text": text
+                    },
+                    "note": f"파일은 보존됩니다: GPT_SoVITS/user/{text}/"
+                }
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={"message": "사용자 삭제에 실패했습니다."}
+            )
+            
+    except Exception as e:
+        return JSONResponse(
+            status_code=500, 
+            content={"message": "사용자 삭제 중 오류가 발생했습니다.", "Exception": str(e)}
+        )
 
 
 def cleanup_experiment_files(exp_dir: str, tmp_dir: str, exp_name: str):
